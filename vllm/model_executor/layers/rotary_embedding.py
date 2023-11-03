@@ -21,12 +21,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Rotary Positional Embeddings."""
+import math
 from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from vllm import pos_encoding_ops
+from vllm.model_executor.input_metadata import InputMetadata
 
 
 class RotaryEmbedding(nn.Module):
@@ -85,6 +87,7 @@ class RotaryEmbedding(nn.Module):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
+        input_metadata: InputMetadata,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # pos_encoding_ops.rotary_embedding() is an in-place operation that
         # updates the query and key tensors.
@@ -167,3 +170,109 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         sin = freqs.sin()
         cache = torch.cat((cos, sin), dim=-1)
         return cache
+
+
+class DynamicNTKScalingRotaryEmbeddingQwen(RotaryEmbedding):
+    """RotaryEmbedding + Qwen's Dynamic-NTK
+
+    Reference: https://huggingface.co/Qwen/Qwen-7B-Chat/blob/main/modeling_qwen.py
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        seq_length: int
+    ) -> None:
+        self._config_seq_length = seq_length # 8192 for Qwen-7B
+        
+        self._seq_len_cached = 0
+        self._ntk_alpha_cached = 1.0
+        super().__init__(head_size, rotary_dim, max_position_embeddings, base,
+                         is_neox_style)
+    
+    def _update_cos_sin_cache(self, max_seq_len):
+        ntk_alpha = self.get_ntk_alpha(max_seq_len)
+
+        if max_seq_len > self._seq_len_cached or ntk_alpha != self._ntk_alpha_cached:
+            base = self.base * ntk_alpha**(self.rotary_dim /(self.rotary_dim - 2))
+            inv_freq = self._compute_inv_freq(base)
+            
+            self._seq_len_cached = max(2 * max_seq_len, 16)
+            self._ntk_alpha_cached = ntk_alpha
+            
+            t = torch.arange(self._seq_len_cached, dtype=torch.float, device="cuda")
+            freqs = torch.einsum("i,j -> ij", t, inv_freq)
+            cos = freqs.cos()
+            sin = freqs.sin()
+            cache = torch.cat((cos, sin), dim=-1)
+            cache = cache.to(self.cos_sin_cache.dtype)
+            self.cos_sin_cache = cache
+        
+    def get_ntk_alpha(self, true_seq_len):
+        # this function is copied from `modeling_qwen.py`
+        context_value = math.log(true_seq_len / self._config_seq_length, 2) + 1
+        ntk_alpha = 2 ** math.ceil(context_value) - 1
+        ntk_alpha = max(ntk_alpha, 1)
+        return ntk_alpha
+
+    ## new implementation of vllm+qwen's dynamic-ntk
+    ## use a for loop to calculate ntk_alpha and the corresponding positioned `q` and `k` for each data in the batch
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # vllm forward has two stages: first forward and continous forward
+        # in first forward，sequence length is stored in `input_metadata.prompt_lens (list)`
+        # in continous forward, sequence length is stored in `input_metadata.context_lens (torch.tensor)`
+        
+        query_list, key_list = [], []
+        
+        # get true sequence length
+        is_continue, seq_lens = False, []
+        if len(input_metadata.prompt_lens) > 0:
+            seq_lens = input_metadata.prompt_lens
+            is_continue = False
+        else:
+            seq_lens = input_metadata.context_lens.tolist()
+            is_continue = True
+
+        batch_size = len(seq_lens)
+        _prev = 0
+        for i, seq_len in enumerate(seq_lens):
+            _start = _prev
+            
+            if is_continue: # continous forward, input for each data has 1 token
+                _end = _start + 1
+            else: # first forward, input for each data has `seq_len` tokens
+                _end = _start + seq_len
+                
+            if i != batch_size - 1:
+                _query = query[_start:_end, :]
+                _key = key[_start:_end, :]
+                _positions = positions[_start:_end]
+            else: # reach paddings
+                _query = query[_start:, :]
+                _key = key[_start:, :]
+                _positions = positions[_start:]
+
+            # update cos_sin_cache with `seq_len`
+            self._update_cos_sin_cache(seq_len)
+            pos_encoding_ops.rotary_embedding(_positions, _query, _key,
+                                              self.head_size, self.cos_sin_cache,
+                                              self.is_neox_style)
+            query_list.append(_query)
+            key_list.append(_key)
+            
+            _prev = _end
+            
+        query = torch.cat(query_list, dim=0)
+        key = torch.cat(key_list, dim=0)
+        
+        return query, key

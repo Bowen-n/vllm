@@ -14,6 +14,21 @@ Easy, fast, and cheap LLM serving for everyone
 
 </p>
 
+## vllm + Qwen's Dynamic-NTK
+
+add the following content in Qwen's `config.json`. 
+
+- `seq_length` is the threshold for activating NTK, default 8192 (the same as Qwen).
+- `factor` does not affect the logic of dynamic-ntk. It is used by vllm to calculate the maximum input length for model. If it is set to 1, warnings will occur if input is longer than 8192. Setting to 4 may be enough.
+
+```
+"rope_scaling": {
+    "type": "dynamic-qwen",
+    "seq_length": 8192,
+    "factor": 4.0
+}
+```
+
 ---
 
 *Latest News* 🔥
